@@ -1,5 +1,5 @@
-# ⚠️ Please don't ask me for any more fixes
-## I did what I can. Maybe another developer can continue the rest.
+# ⚠️ Final release: no further fixes or support
+## This package is complete as it is, and I am not taking requests for additional fixes. Other developers are welcome to continue the work; the source changes are included below.
 
 ---
 
