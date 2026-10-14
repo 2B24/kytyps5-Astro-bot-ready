@@ -1,0 +1,639 @@
+diff --git a/src/graphics/guest_gpu/tile.cpp b/src/graphics/guest_gpu/tile.cpp
+index 3d07ae06..7043ca40 100644
+--- a/src/graphics/guest_gpu/tile.cpp
++++ b/src/graphics/guest_gpu/tile.cpp
+@@ -299,8 +299,8 @@ bool TileGetTextureBlockLayout(Prospero::BufferFormat format, Prospero::TileMode
+ 	if (!TileGetTextureElementLayout(format, element)) {
+ 		return false;
+ 	}
+-	if ((family == TileBlockFamily::Depth64KB || family == TileBlockFamily::RenderTarget64KB) &&
+-	    Prospero::RenderTargetBytesPerElement(format) != element.bytes) {
++	if (family == TileBlockFamily::Depth64KB &&
++	    (element.texel_width != 1 || element.texel_height != 1)) {
+ 		return false;
+ 	}
+ 
+diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.cpp b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+index 9b6994d2..741f3e22 100644
+--- a/src/graphics/host_gpu/renderer/cache/textureCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+@@ -2497,14 +2497,12 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
+ 	const auto available  = buffer.Size() - buf_offset;
+ 	uint32_t   levels     = 0;
+ 	uint64_t   copy_size  = 0;
+-	if (image.info.IsVolume()) {
+-		// Volume mips contain strided block slices, so a mip's linear span cannot prove that
+-		// every retained slice fits. Keep volume synchronization whole-image only.
+-		if (!buffer.IsInBounds(image.info.data.address, image.info.data.size)) {
+-			return false;
+-		}
++	if (buffer.IsInBounds(image.info.data.address, image.info.data.size)) {
+ 		levels    = image.info.resources.levels;
+ 		copy_size = image.info.data.size;
++	} else if (image.info.IsVolume() || image.info.resources.layers > 1) {
++		// Array and volume slices are strided across the full mip chain.
++		return false;
+ 	} else {
+ 		for (; levels < image.info.resources.levels; ++levels) {
+ 			const auto& mip = image.info.mip_layout[levels];
+diff --git a/src/graphics/host_gpu/renderer/debug.cpp b/src/graphics/host_gpu/renderer/debug.cpp
+index d43d4644..78c97e6f 100644
+--- a/src/graphics/host_gpu/renderer/debug.cpp
++++ b/src/graphics/host_gpu/renderer/debug.cpp
+@@ -751,10 +751,22 @@ static std::atomic<bool> g_ab_off {false};
+ 
+ static bool AbEnabled() {
+ 	static const bool enabled =
+-	    DrawPhaseTimer::Hash() != 0 && std::getenv("KYTY_DEBUG_AB") != nullptr;
++	    (DrawPhaseTimer::Hash() != 0 || Config::GetDrainStatsInterval() != 0) &&
++	    std::getenv("KYTY_DEBUG_AB") != nullptr;
+ 	return enabled;
+ }
+ 
++bool AbActive() noexcept {
++	return AbEnabled();
++}
++
++void AbFlip() noexcept {
++	if (!AbEnabled()) {
++		return;
++	}
++	g_ab_off.store(!g_ab_off.load(std::memory_order_relaxed), std::memory_order_relaxed);
++}
++
+ bool AbSelected(const char* feature) noexcept {
+ 	if (!AbEnabled()) {
+ 		return false;
+@@ -1127,8 +1139,9 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
+ 		std::printf("%s\n", pm4.c_str());
+ 		ops = {};
+ 	}
+-	if (AbEnabled()) {
+-		g_ab_off.store(!AbFeatureOff(), std::memory_order_relaxed);
++	// With drain stats, their reporter switches modes so its windows have one mode each.
++	if (Config::GetDrainStatsInterval() == 0) {
++		AbFlip();
+ 	}
+ 	totals.fill(0);
+ 	probe_totals.fill(0);
+diff --git a/src/graphics/host_gpu/renderer/debug.h b/src/graphics/host_gpu/renderer/debug.h
+index 04ca3249..a5f2289a 100644
+--- a/src/graphics/host_gpu/renderer/debug.h
++++ b/src/graphics/host_gpu/renderer/debug.h
+@@ -21,9 +21,10 @@ struct RenderDebugCounters {
+ };
+ inline RenderDebugCounters g_render_debug_counters;
+ 
+-// With KYTY_DEBUG_DRAW_PHASES set, KYTY_DEBUG_AB=<features> turns the named features off in every
+-// other 5 s window, so one run compares both under the same scene and machine load; each
+-// draw-phases line reports its window's mode. Features: reuse (texture and render-target reuse;
++// With KYTY_DEBUG_DRAW_PHASES or --drain-stats, KYTY_DEBUG_AB=<features> turns the named features
++// off in every other window (5 s, or the drain-stats interval, which then sets the windows), so one
++// run compares both under the same scene and machine load; each draw-phases or drain-stats line
++// reports its window's mode. Features: reuse (texture and render-target reuse;
+ // also KYTY_DEBUG_AB=1), pending (rate-limited GPU progress queries at draw entry), backing
+ // (lock-free cached guest backing reads), bdaepoch (one BDA synchronization per epoch), scratch
+ // (pooled tiler scratch buffers), cleanpages (remembered clean pages for GPU-write queries),
+@@ -65,6 +66,9 @@ enum class DebugShaderKind { Pixel, Vertex, Compute };
+                                    bool bisect = true) noexcept;
+ void               RecordFullBarrier(vk::CommandBuffer command) noexcept;
+ [[nodiscard]] bool AbFeatureOff() noexcept;
++// Whether KYTY_DEBUG_AB is in effect, and the switch to the next window's mode.
++[[nodiscard]] bool AbActive() noexcept;
++void               AbFlip() noexcept;
+ // GPU busy time as drain stats measure it (--drain-stats), for the draw-phases line's gpu-ms/s.
+ inline std::atomic<uint64_t> g_gpu_busy_ns {0};
+ // GPU buffers and images created and destroyed, for the draw-phases line's allocation churn.
+diff --git a/src/graphics/host_gpu/renderer/drainStats.cpp b/src/graphics/host_gpu/renderer/drainStats.cpp
+index ade60c03..ef9bdf48 100644
+--- a/src/graphics/host_gpu/renderer/drainStats.cpp
++++ b/src/graphics/host_gpu/renderer/drainStats.cpp
+@@ -1,6 +1,7 @@
+ #include "graphics/host_gpu/renderer/drainStats.h"
+ 
+ #include "common/logging/log.h"
++#include "graphics/host_gpu/renderer/debug.h"
+ #include "kernel/pthread.h"
+ 
+ #include <algorithm>
+@@ -62,10 +63,13 @@ struct FaultSite {
+ 	uint64_t    writer_size  = 0;
+ };
+ 
+-// Per-interval fault sites, keyed by faulting instruction and access. Faults that stall are
+-// rare (a few per frame), so a mutex is cheap here.
++// Per-interval fault sites, keyed by faulting instruction and access. Sky Garden's game threads
++// fault tens of thousands of times a second, so each thread collects its own and merges them
++// when the mutex is free; a busy mutex leaves them for the thread's next fault, which can fall in
++// the next interval.
+ std::mutex                              g_site_mutex;
+ std::unordered_map<uint64_t, FaultSite> g_sites;
++thread_local std::unordered_map<uint64_t, FaultSite> t_pending_sites;
+ 
+ struct GpuWrite {
+ 	uint64_t begin = 0;
+@@ -126,6 +130,8 @@ const char* KindName(Kind kind) {
+ 		case Kind::Lookahead: return "lookahead";
+ 		case Kind::GpuThreadIdle: return "gpu-thread-idle";
+ 		case Kind::StaleRead: return "stale-read";
++		case Kind::FaultTracker: return "fault-tracker";
++		case Kind::FaultTexture: return "fault-texture";
+ 		case Kind::Count: break;
+ 	}
+ 	return "?";
+@@ -346,7 +352,9 @@ bool IsTimeKind(Kind kind) {
+ 		case Kind::ShaderCompile:
+ 		case Kind::PipelineCreate:
+ 		case Kind::Lookahead:
+-		case Kind::GpuThreadIdle: return true;
++		case Kind::GpuThreadIdle:
++		case Kind::FaultTracker:
++		case Kind::FaultTexture: return true;
+ 		default: return false;
+ 	}
+ }
+@@ -376,8 +384,9 @@ void Report(const Snapshot& before, const Snapshot& after, double seconds, bool
+ 	}
+ 
+ 	std::string text = fmt::format(
+-	    "drain-stats: {:.1f}s frames={} ({:.1f}/s) presents={}", seconds, frames,
+-	    frames / seconds, after.presents - before.presents);
++	    "drain-stats: {:.1f}s frames={} ({:.1f}/s) presents={}{}", seconds, frames,
++	    frames / seconds, after.presents - before.presents,
++	    !interval || !AbActive() ? "" : (AbFeatureOff() ? " ab=off" : " ab=on"));
+ 	for (const auto kind: {Kind::FullDrain, Kind::TickWait, Kind::PriorityWait, Kind::BlockedPoll,
+ 	                       Kind::Submit, Kind::QueueLockWait, Kind::GpuBusy, Kind::GpuGap}) {
+ 		const auto k  = static_cast<size_t>(kind);
+@@ -490,6 +499,8 @@ void Run(std::stop_token stop, uint32_t interval_seconds) {
+ 		}
+ 		Report(previous, current,
+ 		       std::chrono::duration<double>(current_time - previous_time).count());
++		// KYTY_DEBUG_AB: the next window runs in the other mode.
++		AbFlip();
+ 		previous      = std::move(current);
+ 		previous_time = current_time;
+ 	}
+@@ -539,8 +550,7 @@ void RecordFaultSite(uint64_t pc, uint64_t address, bool write, uint64_t ns) noe
+ 			}
+ 		}
+ 	}
+-	std::lock_guard lock(g_site_mutex);
+-	auto&           site = g_sites[key];
++	auto& site = t_pending_sites[key];
+ 	if (writer.end != 0) {
+ 		site.written++;
+ 		site.frame_age += g_frames.load(std::memory_order_relaxed) - writer.frame;
+@@ -548,7 +558,7 @@ void RecordFaultSite(uint64_t pc, uint64_t address, bool write, uint64_t ns) noe
+ 		site.writer_begin = writer.begin;
+ 		site.writer_size  = writer.end - writer.begin;
+ 	}
+-	if (site.count == 0) {
++	if (site.thread.empty()) {
+ 		char name[64] = "(host thread)";
+ 		if (auto self = LibKernel::PthreadSelfOrNull(); self != nullptr) {
+ 			if (LibKernel::PthreadGetname(self, name) != 0) {
+@@ -561,6 +571,35 @@ void RecordFaultSite(uint64_t pc, uint64_t address, bool write, uint64_t ns) noe
+ 	site.count++;
+ 	site.ns += ns;
+ 	site.last_address = address;
++	std::unique_lock lock(g_site_mutex, std::try_to_lock);
++	if (!lock.owns_lock()) {
++		return;
++	}
++	// Merged entries stay, zeroed, so the next faults at a site allocate nothing.
++	for (auto& [pending_key, pending]: t_pending_sites) {
++		if (pending.count == 0) {
++			continue;
++		}
++		auto& merged = g_sites[pending_key];
++		if (merged.count == 0) {
++			merged.thread = pending.thread;
++			merged.write  = pending.write;
++		}
++		merged.count += pending.count;
++		merged.ns += pending.ns;
++		merged.last_address = pending.last_address;
++		if (pending.written != 0) {
++			merged.written += pending.written;
++			merged.frame_age += pending.frame_age;
++			merged.writer_op    = pending.writer_op;
++			merged.writer_begin = pending.writer_begin;
++			merged.writer_size  = pending.writer_size;
++		}
++		pending.count     = 0;
++		pending.ns        = 0;
++		pending.written   = 0;
++		pending.frame_age = 0;
++	}
+ }
+ 
+ void RecordGpuWrite(uint64_t vaddr, uint64_t size) noexcept {
+diff --git a/src/graphics/host_gpu/renderer/drainStats.h b/src/graphics/host_gpu/renderer/drainStats.h
+index c1fa6034..dc66a43c 100644
+--- a/src/graphics/host_gpu/renderer/drainStats.h
++++ b/src/graphics/host_gpu/renderer/drainStats.h
+@@ -59,6 +59,8 @@ enum class Kind : uint8_t {
+ 	Lookahead,          // A pipeline look-ahead walk, including the shaders it translated, in ns.
+ 	GpuThreadIdle,      // Thread_Gpu waiting for a submission or command, in ns.
+ 	StaleRead,          // A guest read answered with previous bytes (relaxed readback).
++	FaultTracker,       // A write fault's buffer-cache part (dirty bits, page protection), in ns.
++	FaultTexture,       // A write fault's texture-cache part, in ns.
+ 	Count,
+ };
+ 
+diff --git a/src/graphics/host_gpu/renderer/renderContext.cpp b/src/graphics/host_gpu/renderer/renderContext.cpp
+index f5b0c0d5..61301d4f 100644
+--- a/src/graphics/host_gpu/renderer/renderContext.cpp
++++ b/src/graphics/host_gpu/renderer/renderContext.cpp
+@@ -95,8 +95,14 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
+ 		DrainStats::ReasonScope reason(gpu_thread ? DrainStats::Reason::GpuThreadWriteFault
+ 		                                          : DrainStats::Reason::GuestWriteFault);
+ 		RecordUpload(UploadSource::Fault, fault_vaddr, 0x1000);
+-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+-		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
++		{
++			DrainStats::WaitTimer timer(DrainStats::Kind::FaultTracker);
++			m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
++		}
++		{
++			DrainStats::WaitTimer timer(DrainStats::Kind::FaultTexture);
++			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
++		}
+ 		if (gpu_thread) {
+ 			// The command stream writes this (WRITE_DATA, fills): later draws must see it.
+ 			AdvanceBdaEpoch();
+diff --git a/src/graphics/host_gpu/renderer/renderDraw.cpp b/src/graphics/host_gpu/renderer/renderDraw.cpp
+index a66e2146..f00c9849 100644
+--- a/src/graphics/host_gpu/renderer/renderDraw.cpp
++++ b/src/graphics/host_gpu/renderer/renderDraw.cpp
+@@ -1476,8 +1476,19 @@ static const std::vector<uint64_t>& ImageUsersShaders() {
+ 	return shaders;
+ }
+ 
++// KYTY_DEBUG_IMAGE_USERS_MISMATCH=1: also every binding whose cache image differs from the guest
++// request in address, tile mode, pitch or extent: a view into a larger image, or memory the guest
++// reads with another layout than the one it was rendered with.
++static bool ImageUsersMismatch() {
++	static const bool enabled = [] {
++		const char* text = std::getenv("KYTY_DEBUG_IMAGE_USERS_MISMATCH");
++		return text != nullptr && std::strcmp(text, "0") != 0;
++	}();
++	return enabled;
++}
++
+ bool ImageUsersEnabled() {
+-	return ImageUsersAddress() != 0 || !ImageUsersShaders().empty();
++	return ImageUsersAddress() != 0 || !ImageUsersShaders().empty() || ImageUsersMismatch();
+ }
+ 
+ void NoteImageUsers(TextureCache& cache, std::span<PreparedBindings* const> stages,
+@@ -1506,7 +1517,13 @@ void NoteImageUsers(TextureCache& cache, std::span<PreparedBindings* const> stag
+ 		const auto& image     = cache.GetImage(id);
+ 		const auto& request   = desc.info.data;
+ 		const bool  requested = address >= request.address && address < request.End();
+-		if (!every && !requested &&
++		const bool  mismatch  = ImageUsersMismatch() &&
++		                      (image.info.data.address != request.address ||
++		                       image.info.tile_mode != desc.info.tile_mode ||
++		                       image.info.pitch != desc.info.pitch ||
++		                       image.info.extent.width != desc.info.extent.width ||
++		                       image.info.extent.height != desc.info.extent.height);
++		if (!every && !requested && !mismatch &&
+ 		    (address < image.info.data.address || address >= image.info.data.End())) {
+ 			return;
+ 		}
+@@ -1515,18 +1532,20 @@ void NoteImageUsers(TextureCache& cache, std::span<PreparedBindings* const> stag
+ 		                    vk::to_string(image.info.pixel_format), desc.info.extent.width,
+ 		                    desc.info.extent.height);
+ 		counts[fmt::format("ps={:016x} vs={:016x} {} stage={} slot={}{} req=0x{:x}+0x{:x} {} "
+-		                   "guest_fmt={} tile={} {}x{} view={}+{} layers {}+{} -> image=0x{:x}+0x{:x} {} "
+-		                   "tile={} {}x{} cpu_dirty={} buf_mod={} gpu_mod={}",
++		                   "guest_fmt={} tile={} {}x{} pitch={} view={}+{} layers {}+{} -> "
++		                   "image=0x{:x}+0x{:x} {} tile={} {}x{} pitch={} cpu_dirty={} buf_mod={} "
++		                   "gpu_mod={}",
+ 		                   pixel_hash, vertex_hash, role, stage, slot, extra, request.address,
+ 		                   request.size, vk::to_string(desc.info.pixel_format),
+ 		                   static_cast<uint32_t>(desc.info.guest_format),
+ 		                   static_cast<uint32_t>(desc.info.tile_mode), desc.info.extent.width,
+-		                   desc.info.extent.height, view.base_level, view.level_count,
+-		                   view.base_layer, view.layer_count, image.info.data.address,
+-		                   image.info.data.size, vk::to_string(image.info.pixel_format),
++		                   desc.info.extent.height, desc.info.pitch, view.base_level,
++		                   view.level_count, view.base_layer, view.layer_count,
++		                   image.info.data.address, image.info.data.size,
++		                   vk::to_string(image.info.pixel_format),
+ 		                   static_cast<uint32_t>(image.info.tile_mode), image.info.extent.width,
+-		                   image.info.extent.height, image.IsCpuDirty() ? 1 : 0, image.IsBufferModified() ? 1 : 0,
+-		                   image.IsGpuModified() ? 1 : 0)]++;
++		                   image.info.extent.height, image.info.pitch, image.IsCpuDirty() ? 1 : 0,
++		                   image.IsBufferModified() ? 1 : 0, image.IsGpuModified() ? 1 : 0)]++;
+ 	};
+ 	for (const auto* stage: stages) {
+ 		const auto& program    = *stage->runtime->program;
+diff --git a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
+index 08972ac4..b6c66234 100644
+--- a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
++++ b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
+@@ -29,6 +29,18 @@ namespace {
+ 
+ constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
+ 
++// Neither the guest nor the host maps the first 64 KiB. Raw reads there come from unbound (null)
++// tables on paths the walker explores speculatively, so they read as null descriptors.
++constexpr uint64_t NullPageSize = 0x10000ull;
++
++void ReadHostMemory(uint64_t address, std::span<uint32_t> values) {
++	if (address < NullPageSize) {
++		std::ranges::fill(values, 0u);
++		return;
++	}
++	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
++}
++
+ bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
+ 	if (base > AddressMask) {
+ 		return false;
+@@ -486,7 +498,7 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
+ 			return false;
+ 		}
+ 	} else {
+-		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
++		ReadHostMemory(address, {&word, 1});
+ 	}
+ 	result = word;
+ 	return true;
+@@ -1609,7 +1621,7 @@ bool SrtEvaluator::EvaluateRawRead(const ResourceNode& node, uint64_t& result) {
+ 			return false;
+ 		}
+ 	} else {
+-		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
++		ReadHostMemory(address, {&word, 1});
+ 	}
+ 	result = word;
+ 	return true;
+@@ -2115,7 +2127,7 @@ bool SrtEvaluator::ReadFlatRun(const CompiledResourcePlan::FlatRun& run,
+ 				return false;
+ 			}
+ 		} else {
+-			std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
++			ReadHostMemory(address, values);
+ 		}
+ 		done += static_cast<uint32_t>(count);
+ 	}
+diff --git a/src/libs/controller.cpp b/src/libs/controller.cpp
+index 9e11d3b6..2af2a696 100644
+--- a/src/libs/controller.cpp
++++ b/src/libs/controller.cpp
+@@ -66,8 +66,13 @@ struct PadTriggerEffectParam {
+ 	PadTriggerEffectCommand command[2];
+ };
+ 
++struct PadTriggerEffectStateInformation {
++	int32_t state[2];
++};
++
+ static_assert(sizeof(PadTriggerEffectCommand) == 56);
+ static_assert(sizeof(PadTriggerEffectParam) == 120);
++static_assert(sizeof(PadTriggerEffectStateInformation) == 8);
+ 
+ struct DualSenseEffects {
+ 	uint8_t enable_bits;
+@@ -117,6 +122,7 @@ public:
+ 	int  GetActiveControllerId();
+ 	void SetLightBar(uint8_t r, uint8_t g, uint8_t b);
+ 	bool SetTriggerEffect(const PadTriggerEffectParam& param);
++	void GetTriggerEffectState(PadTriggerEffectStateInformation* info);
+ 	void ReadState(ControllerState* state, bool* flag, int* count);
+ 	int  ReadStates(ControllerState* states, int states_num, bool* flag, int* count);
+ 
+@@ -125,6 +131,8 @@ private:
+ 
+ 	void CheckActive();
+ 	void AddState();
++	// Caller holds m_mutex.
++	void UpdateTriggerEffectState();
+ 
+ 	Common::Mutex    m_mutex;
+ 	std::vector<int> m_connected_ids;
+@@ -139,6 +147,9 @@ private:
+ 	uint32_t         m_states_num    = 0;
+ 	uint32_t         m_first_state   = 0;
+ 	uint8_t          m_next_touch_id = 1;
++	// The game's last effect per trigger, and the state scePadGetTriggerEffectState reports.
++	PadTriggerEffectParam            m_trigger_effect {};
++	PadTriggerEffectStateInformation m_trigger_state {};
+ };
+ 
+ static GameController* g_controller = nullptr;
+@@ -266,6 +277,54 @@ static bool trigger_effect_to_dualsense(const PadTriggerEffectCommand& command,
+ 	}
+ }
+ 
++// scePadGetTriggerEffectState values, as duaLib (WujekFoliarz/duaLib) reads them from a DualSense
++// input report. SDL does not expose that report, so they are derived from the game's effect and
++// the trigger's travel (ported from KytyPS5 3c62359e, "Fix/trigger effect state").
++enum TriggerState : int32_t {
++	TRIGGER_STATE_OFF               = 0,
++	TRIGGER_STATE_FEEDBACK_STANDBY  = 1,
++	TRIGGER_STATE_FEEDBACK_ACTIVE   = 2,
++	TRIGGER_STATE_WEAPON_STANDBY    = 3,
++	TRIGGER_STATE_WEAPON_PULLING    = 4,
++	TRIGGER_STATE_WEAPON_FIRED      = 5,
++	TRIGGER_STATE_VIBRATION_STANDBY = 6,
++	TRIGGER_STATE_VIBRATION_ACTIVE  = 7,
++};
++
++static int32_t TriggerEffectState(const PadTriggerEffectCommand& command, int value,
++                                  int32_t previous) {
++	// Trigger positions use nonuniform travel ranges, with endpoints at 0 and 255.
++	const int pos = value == 0 ? 0 : value == 255 ? 9 : 1 + value / 32;
++	switch (command.mode) {
++		case 1: // feedback: resistance from position data[0], strength data[1]
++			return command.data[1] != 0 && pos >= command.data[0] ? TRIGGER_STATE_FEEDBACK_ACTIVE
++			                                                      : TRIGGER_STATE_FEEDBACK_STANDBY;
++		case 2: // weapon: resistance from data[0], released at data[1]
++			if (value < command.data[0] * 32) {
++				return TRIGGER_STATE_WEAPON_STANDBY;
++			}
++			return previous == TRIGGER_STATE_WEAPON_FIRED ||
++			               value >= std::min(command.data[1] * 32, 254)
++			           ? TRIGGER_STATE_WEAPON_FIRED
++			           : TRIGGER_STATE_WEAPON_PULLING;
++		case 3: // vibration from position data[0], amplitude data[1], frequency data[2]
++			return command.data[1] != 0 && command.data[2] != 0 && pos >= command.data[0]
++			           ? TRIGGER_STATE_VIBRATION_ACTIVE
++			           : TRIGGER_STATE_VIBRATION_STANDBY;
++		case 4: // multiple-position feedback: strength per position
++			return command.data[pos] != 0 ? TRIGGER_STATE_FEEDBACK_ACTIVE
++			                              : TRIGGER_STATE_FEEDBACK_STANDBY;
++		case 5: // slope feedback between data[0] and data[1]
++			return pos >= command.data[0] && pos < command.data[1] ? TRIGGER_STATE_FEEDBACK_ACTIVE
++			                                                       : TRIGGER_STATE_FEEDBACK_STANDBY;
++		case 6: // multiple-position vibration: frequency data[0], amplitude per position
++			return command.data[0] != 0 && command.data[1 + pos] != 0
++			           ? TRIGGER_STATE_VIBRATION_ACTIVE
++			           : TRIGGER_STATE_VIBRATION_STANDBY;
++		default: return TRIGGER_STATE_OFF;
++	}
++}
++
+ void Initialize() {
+ 	EXIT_IF(g_controller != nullptr);
+ 
+@@ -341,13 +400,15 @@ void GameController::CheckActive() {
+ 	if (!m_connected && new_connected) {
+ 		m_connected_count++;
+ 	}
+-	m_active_id     = new_active_id;
+-	m_connected     = new_connected;
+-	m_state         = {};
+-	m_gyro_time     = 0;
+-	m_states_num    = 0;
+-	m_first_state   = 0;
+-	m_next_touch_id = 1;
++	m_active_id      = new_active_id;
++	m_connected      = new_connected;
++	m_state          = {};
++	m_gyro_time      = 0;
++	m_states_num     = 0;
++	m_first_state    = 0;
++	m_next_touch_id  = 1;
++	m_trigger_effect = {};
++	m_trigger_state  = {};
+ }
+ 
+ void GameController::AddState() {
+@@ -395,6 +456,7 @@ void GameController::Axis(int id, Controller::Axis axis, int value) {
+ 		}
+ 		if (trigger != 0) {
+ 			m_state.buttons = value > 0 ? m_state.buttons | trigger : m_state.buttons & ~trigger;
++			UpdateTriggerEffectState();
+ 		}
+ 
+ 		AddState();
+@@ -508,6 +570,7 @@ void GameController::ResetInputState() {
+ 	m_state.buttons = 0;
+ 	std::fill_n(m_state.axes, 4, 128);
+ 	std::fill_n(m_state.axes + 4, 2, 0);
++	UpdateTriggerEffectState();
+ 	for (auto& touch: m_state.touch) {
+ 		touch = {};
+ 	}
+@@ -610,6 +673,13 @@ bool GameController::SetTriggerEffect(const PadTriggerEffectParam& param) {
+ 	}
+ 
+ 	Common::LockGuard lock(m_mutex);
++	// Kept for every pad, not only a DualSense: the reported state follows the game's effect.
++	for (int i = 0; i < 2; i++) {
++		if ((param.trigger_mask & (1u << i)) != 0) {
++			m_trigger_effect.command[i] = param.command[i];
++		}
++	}
++	UpdateTriggerEffectState();
+ 	auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
+ 	if (pad != nullptr && SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5) {
+ 		(void)SDL_SendGamepadEffect(pad, &effect, sizeof(effect));
+@@ -617,6 +687,21 @@ bool GameController::SetTriggerEffect(const PadTriggerEffectParam& param) {
+ 	return true;
+ }
+ 
++void GameController::GetTriggerEffectState(PadTriggerEffectStateInformation* info) {
++	Common::LockGuard lock(m_mutex);
++	*info = m_trigger_state;
++}
++
++void GameController::UpdateTriggerEffectState() {
++	// Updated on every trigger event, so a weapon stays fired when the game polls after the
++	// release has started.
++	for (int i = 0; i < 2; i++) {
++		m_trigger_state.state[i] = TriggerEffectState(
++		    m_trigger_effect.command[i], m_state.axes[static_cast<int>(Axis::TriggerLeft) + i],
++		    m_trigger_state.state[i]);
++	}
++}
++
+ void GameController::GetConnectionInfo(bool* flag, int* count) {
+ 	EXIT_IF(flag == nullptr);
+ 	EXIT_IF(count == nullptr);
+@@ -952,4 +1037,21 @@ int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const PadTriggerEffectParam* p
+ 	return g_controller->SetTriggerEffect(*param) ? OK : PAD_ERROR_INVALID_ARG;
+ }
+ 
++int KYTY_SYSV_ABI PadGetTriggerEffectState(int handle, PadTriggerEffectStateInformation* info) {
++	PRINT_NAME();
++
++	LOGF("\t handle = %d\n", handle);
++
++	if (handle != 1) {
++		return PAD_ERROR_INVALID_HANDLE;
++	}
++	if (info == nullptr) {
++		return PAD_ERROR_INVALID_ARG;
++	}
++
++	g_controller->GetTriggerEffectState(info);
++
++	return OK;
++}
++
+ } // namespace Libs::Controller
+diff --git a/src/libs/controller.h b/src/libs/controller.h
+index 217e23cd..f477d515 100644
+--- a/src/libs/controller.h
++++ b/src/libs/controller.h
+@@ -53,6 +53,7 @@ struct PadData;
+ struct PadVibrationParam;
+ struct PadLightBarParam;
+ struct PadTriggerEffectParam;
++struct PadTriggerEffectStateInformation;
+ 
+ inline int controller_get_axis(int min, int max, int value) {
+ 	int v = (255 * (value - min)) / (max - min);
+@@ -87,6 +88,7 @@ int KYTY_SYSV_ABI PadReadState(int handle, PadData* data);
+ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num);
+ int KYTY_SYSV_ABI PadSetVibration(int handle, const PadVibrationParam* param);
+ int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const PadTriggerEffectParam* param);
++int KYTY_SYSV_ABI PadGetTriggerEffectState(int handle, PadTriggerEffectStateInformation* info);
+ int KYTY_SYSV_ABI PadResetLightBar(int handle);
+ int KYTY_SYSV_ABI PadSetLightBar(int handle, const PadLightBarParam* param);
+ 
+diff --git a/src/libs/libPad.cpp b/src/libs/libPad.cpp
+index 38e9c1d6..ab9a861f 100644
+--- a/src/libs/libPad.cpp
++++ b/src/libs/libPad.cpp
+@@ -22,26 +22,6 @@ static int KYTY_SYSV_ABI PadSetVibrationMode(int handle, int mode) {
+ 	return 0;
+ }
+ 
+-struct PadTriggerEffectStateInformation {
+-	int32_t state[2];
+-};
+-
+-static int KYTY_SYSV_ABI PadGetTriggerEffectState(int                               handle,
+-                                                  PadTriggerEffectStateInformation* info) {
+-	PRINT_NAME();
+-
+-	LOGF("\t handle = %d\n", handle);
+-
+-	if (info == nullptr) {
+-		return -2137653243; /* 0x80960005 */
+-	}
+-
+-	info->state[0] = 0;
+-	info->state[1] = 0;
+-
+-	return 0;
+-}
+-
+ static int KYTY_SYSV_ABI PadSetVibrationTriggerEffectWeakWhileEmbeddedMicInUse(bool enabled) {
+ 	PRINT_NAME();
+ 
+@@ -214,7 +194,7 @@ LIB_DEFINE(InitPad_1) {
+ 	LIB_FUNC("yFVnOdGxvZY", Controller::PadSetVibration);
+ 	LIB_FUNC("W2G-yoyMF5U", PadSetVibrationMode);
+ 	LIB_FUNC("Yq0zOH7YNOM", PadSetVibrationTriggerEffectWeakWhileEmbeddedMicInUse);
+-	LIB_FUNC("znaWI0gpuo8", PadGetTriggerEffectState);
++	LIB_FUNC("znaWI0gpuo8", Controller::PadGetTriggerEffectState);
+ 	LIB_FUNC("DscD1i9HX1w", Controller::PadResetLightBar);
+ 	LIB_FUNC("RR4novUEENY", Controller::PadSetLightBar);
+ 	LIB_FUNC("6ncge5+l5Qs", PadClose);
