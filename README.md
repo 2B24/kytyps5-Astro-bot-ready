@@ -1,3 +1,8 @@
+# ⚠️ Please don't ask me for any more fixes
+## I did what I can. Maybe another developer can continue the rest.
+
+---
+
 # KytyPS5 – Astro Bot ready
 
 A ready-to-play package of the **KytyPS5** PlayStation 5 emulator, set up and fixed for **ASTRO BOT** on Windows.
