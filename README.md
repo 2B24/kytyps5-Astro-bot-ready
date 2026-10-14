@@ -63,10 +63,31 @@ All the emulator work belongs to the people above. Please support the original p
 
 ## How to use
 
+All fixes are already included. You only add your game and start it.
+
 1. Download **Astro Bot PC by 2B.rar** and extract it to its own folder, for example `C:\Games\Astro Bot`.
-2. Copy the **contents** of your Astro Bot game folder into the **`Game`** folder, so that `Game\eboot.bin` exists.
-3. Double-click **`Play Astro Bot.bat`** (fullscreen, 4K on a 4K screen), or **`Play Astro Bot - Window.bat`** (1920x1080 window, faster).
-4. Quit with **Alt+F4** so the shader cache is saved. The first run stutters while shaders build; later runs are smoother.
+2. Copy the **contents** of your Astro Bot game folder directly into the **`Game`** folder:
+
+   | | Path |
+   |---|---|
+   | ✅ Correct | `Game\eboot.bin` and `Game\sce_sys\param.json` |
+   | ❌ Wrong | `Game\PPSA21567\eboot.bin` (an extra folder inside `Game`) |
+
+   If the game files are not found, the launcher shows a message instead of starting.
+3. Make sure your game is **version 01.019.000** (PPSA21567). The lighting patch only matches this version.
+   Other versions still start and the L2/R2 fix still works, but the lighting falls back to black silhouettes.
+4. Double-click **`Play Astro Bot.bat`** (fullscreen, 4K on a 4K screen), or **`Play Astro Bot - Window.bat`** (1920x1080 window, faster).
+5. Quit with **Alt+F4** so the shader cache is saved. The first run stutters while shaders build; later runs are smoother.
+
+### Troubleshooting
+
+| Problem | Solution |
+|---|---|
+| Nothing happens, or an error about a missing DLL | Install the [Microsoft Visual C++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe). |
+| "The game files are missing" | Check step 2: `Game\eboot.bin` must exist. |
+| The controller does nothing | Click once on the game window. |
+| Very low FPS (5–15) | Close programs that use video memory (other games, image or video tools, many browser tabs). |
+| Black characters or dark lighting | Your game is not version 01.019.000 (step 3). |
 
 | Key | Action |
 |---|---|
